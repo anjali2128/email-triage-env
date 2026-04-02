@@ -1,0 +1,42 @@
+name: email-triage-env
+version: "1.0.0"
+description: >
+  A real-world email triage environment where an AI agent must prioritize,
+  categorize, label, and draft responses to a realistic inbox of emails.
+  Models the daily workflow of a support/operations professional handling
+  mixed-urgency communications.
+author: openenv-submission
+tags:
+  - openenv
+  - email
+  - triage
+  - nlp
+  - real-world
+  - support
+tasks:
+  - id: easy_triage
+    name: "Basic Email Triage"
+    description: "Classify and prioritize 5 emails by urgency and category"
+    difficulty: easy
+  - id: medium_triage
+    name: "Inbox Zero Sprint"
+    description: "Triage 10 emails: classify, label, and decide reply/archive/escalate"
+    difficulty: medium
+  - id: hard_triage
+    name: "Full Support Shift"
+    description: "Handle 15 mixed emails: classify, draft short replies for action items, escalate critical issues"
+    difficulty: hard
+observation_space:
+  type: object
+  description: "Current inbox state — list of emails with metadata, agent action history, performance stats"
+action_space:
+  type: object
+  description: "Agent actions: classify(email_id, urgency, category), reply(email_id, body), archive(email_id), escalate(email_id, reason)"
+reward_range: [0.0, 1.0]
+episode_steps_max: 50
+api:
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
+  tasks: GET /tasks
+  validate: GET /validate

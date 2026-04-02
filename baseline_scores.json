@@ -1,0 +1,36 @@
+{
+  "model": "Qwen/Qwen2.5-72B-Instruct",
+  "api_base": "https://router.huggingface.co/v1",
+  "scores": {
+    "easy_triage": 1.0,
+    "medium_triage": 0.79,
+    "hard_triage": 0.6098
+  },
+  "details": {
+    "easy_triage": {
+      "score": 1.0,
+      "urgency_accuracy": 1.0,
+      "category_accuracy": 1.0,
+      "coverage": 1.0,
+      "total_emails": 5
+    },
+    "medium_triage": {
+      "score": 0.79,
+      "urgency_accuracy": 0.7,
+      "category_accuracy": 0.7,
+      "action_accuracy": 0.9,
+      "coverage": 1.0,
+      "total_emails": 10
+    },
+    "hard_triage": {
+      "score": 0.6098,
+      "urgency_score": 0.88,
+      "category_accuracy": 0.733,
+      "action_accuracy": 0.4,
+      "reply_quality": 0.417,
+      "critical_handling": 0.333,
+      "total_emails": 15
+    }
+  },
+  "elapsed_seconds": 218.14
+}
