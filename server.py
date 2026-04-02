@@ -174,3 +174,13 @@ def grade(task_id: str = "easy_triage"):
         raise HTTPException(status_code=400, detail=f"Unknown task_id: {task_id}")
     result = GRADERS[task_id](_env)
     return result
+
+
+
+def main():
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=7860)
+
+
+if __name__ == "__main__":
+    main()

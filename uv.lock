@@ -1,0 +1,17 @@
+version = 1
+requires-python = ">=3.10"
+
+[[package]]
+name = "email-triage-env"
+version = "1.0.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "fastapi" },
+    { name = "uvicorn" },
+    { name = "pydantic" },
+    { name = "openai" },
+    { name = "pyyaml" },
+    { name = "httpx" },
+    { name = "python-multipart" },
+    { name = "openenv-core" },
+]
