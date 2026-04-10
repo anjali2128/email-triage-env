@@ -193,9 +193,7 @@ def parse_action(text: str) -> Optional[Dict[str, Any]]:
 
 def run_local_task(task_id: str, client: OpenAI) -> Dict[str, Any]:
     """Run one task using the local environment (no HTTP)."""
-    print(f"\n{'='*60}")
-    print(f"Task: {task_id}")
-    print('='*60)
+    print(f"[START] task={task_id}", flush=True)
 
     env = EmailTriageEnv()
     obs = env.reset(task_id=task_id)
@@ -215,7 +213,7 @@ def run_local_task(task_id: str, client: OpenAI) -> Dict[str, Any]:
 
         llm_response = call_llm(client, conversation)
         if llm_response == _FATAL_ERROR:
-            print(f"  [FATAL] API quota exhausted — stopping task early. Partial score will be saved.")
+            print(f"  [FATAL] API quota exhausted — stopping task early. Partial score will be saved.", flush=True)
             break
         if not llm_response:
             step += 1
@@ -225,7 +223,7 @@ def run_local_task(task_id: str, client: OpenAI) -> Dict[str, Any]:
         action_dict = parse_action(llm_response)
 
         if not action_dict:
-            print(f"  Step {step+1}: Could not parse action from LLM output")
+            print(f"  Step {step+1}: Could not parse action from LLM output", flush=True)
             step += 1
             continue
 
@@ -242,15 +240,16 @@ def run_local_task(task_id: str, client: OpenAI) -> Dict[str, Any]:
             obs_dict = result.observation.model_dump()
 
             print(
-                f"  Step {step+1}: {action.action_type}({action.email_id}) "
-                f"→ reward={result.reward.step_reward:.3f} | {result.observation.last_action_result[:80]}"
+                f"[STEP] step={step+1} reward={result.reward.step_reward:.3f} "
+                f"action={action.action_type} email={action.email_id}",
+                flush=True
             )
 
             if result.done:
                 break
 
         except Exception as e:
-            print(f"  Step {step+1}: Error applying action: {e}")
+            print(f"  Step {step+1}: Error applying action: {e}", flush=True)
 
         step += 1
         time.sleep(0.3)  # Rate limit friendliness
@@ -258,8 +257,7 @@ def run_local_task(task_id: str, client: OpenAI) -> Dict[str, Any]:
     # Final grade
     grader = GRADERS[task_id]
     grade = grader(env)
-    print(f"\n  Final score: {grade['score']:.4f}")
-    print(f"  Grader details: {json.dumps({k: v for k, v in grade.items() if k != 'score'}, indent=2)}")
+    print(f"[END] task={task_id} score={grade['score']:.4f} steps={step}", flush=True)
     return grade
 
 
