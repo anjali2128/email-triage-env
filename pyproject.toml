@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 server = "server:main"
+inference = "inference:main" 
 
 [build-system]
 requires = ["hatchling"]
