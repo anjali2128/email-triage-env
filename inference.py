@@ -1,12 +1,5 @@
 """
-inference.py — Baseline agent for Email Triage OpenEnv.
-
-Prints structured [START]/[STEP]/[END] blocks required by the validator.
-
-Environment variables:
-  API_BASE_URL  : LLM API base URL
-  MODEL_NAME    : Model identifier  
-  HF_TOKEN      : API key (required, no default)
+inference.py — Fixed agent for Email Triage OpenEnv.
 """
 from __future__ import annotations
 
@@ -17,13 +10,16 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# ── Print immediately so validator sees output even on crash ──────────────────
+print("[INFO] inference.py starting...", flush=True)
+
 try:
     from openai import OpenAI
 except ImportError:
     print("ERROR: openai package not installed.", flush=True)
     sys.exit(1)
 
-# ── Load .env if present ──────────────────────────────────────────────────────
+# ── Load .env ─────────────────────────────────────────────────────────────────
 def _load_dotenv(path: str = ".env") -> None:
     env_file = Path(path)
     if not env_file.exists():
@@ -43,15 +39,21 @@ _load_dotenv()
 # ── Config ────────────────────────────────────────────────────────────────────
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-HF_TOKEN     = os.getenv("HF_TOKEN")  # No default per validator requirements
+HF_TOKEN     = os.getenv("HF_TOKEN")  # No default
 
-# ── Import env ───────────────────────────────────────────────────────────────
+print(f"[INFO] Model: {MODEL_NAME}", flush=True)
+print(f"[INFO] API:   {API_BASE_URL}", flush=True)
+
+# ── Import env ────────────────────────────────────────────────────────────────
+LOCAL_ENV_AVAILABLE = False
 try:
     from env.environment import Action, EmailTriageEnv
     from env.graders import GRADERS
     LOCAL_ENV_AVAILABLE = True
-except ImportError:
-    LOCAL_ENV_AVAILABLE = False
+    print("[INFO] env module loaded successfully.", flush=True)
+except ImportError as e:
+    print(f"[ERROR] Could not import env module: {e}", flush=True)
+    sys.exit(1)
 
 TASKS = ["easy_triage", "medium_triage", "hard_triage"]
 
@@ -75,13 +77,17 @@ _FATAL = "__FATAL__"
 def call_llm(client: OpenAI, messages: List[Dict]) -> Optional[str]:
     try:
         response = client.chat.completions.create(
-            model=MODEL_NAME, messages=messages, temperature=0.2, max_tokens=512,
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=0.2,
+            max_tokens=512,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
         err = str(e)
         if any(x in err for x in ["402", "401", "insufficient_quota", "depleted"]):
             return _FATAL
+        print(f"[WARN] LLM call failed: {err}", flush=True)
         return None
 
 
@@ -101,38 +107,57 @@ def parse_action(text: str) -> Optional[Dict[str, Any]]:
 def build_prompt(obs: Dict[str, Any]) -> str:
     pending = [e for e in obs["inbox"] if e["status"] == "pending"]
     classified = [e for e in obs["inbox"] if e["status"] == "classified"]
-    lines = [f"Step {obs['step_number']}/{obs['max_steps']} | Pending:{obs['pending_count']} Done:{obs['done_count']}", ""]
+    lines = [
+        f"Step {obs['step_number']}/{obs['max_steps']} | "
+        f"Pending:{obs['pending_count']} Done:{obs['done_count']}",
+        ""
+    ]
     emails = pending[:3] if pending else classified[:3]
     label = "CLASSIFY THESE" if pending else "ACT ON THESE"
     lines.append(f"=== {label} ===")
     for entry in emails:
-        e = entry["email"]
-        lines.append(f"ID:{e['id']} Subject:{e['subject']}")
-        lines.append(f"Body:{e['body'][:200]}")
+        em = entry["email"]
+        lines.append(f"ID:{em['id']} Subject:{em['subject']}")
+        lines.append(f"Body:{em['body'][:200]}")
         if not pending:
-            lines.append(f"Urgency:{entry.get('assigned_urgency')} Category:{entry.get('assigned_category')}")
+            lines.append(
+                f"Urgency:{entry.get('assigned_urgency')} "
+                f"Category:{entry.get('assigned_category')}"
+            )
     lines.append("\nOutput ONE JSON action:")
     return "\n".join(lines)
 
 
 def run_task(task_id: str, client: OpenAI) -> Dict[str, Any]:
+    # ✅ This is what the validator looks for
     print(f"[START] task={task_id}", flush=True)
 
-    env = EmailTriageEnv()
-    obs = env.reset(task_id=task_id)
-    obs_dict = obs.model_dump()
+    try:
+        env = EmailTriageEnv()
+        obs = env.reset(task_id=task_id)
+        obs_dict = obs.model_dump()
+    except Exception as e:
+        print(f"[ERROR] Failed to reset env for {task_id}: {e}", flush=True)
+        print(f"[END] task={task_id} score=0.0000 steps=0", flush=True)
+        return {"score": 0.0}
+
     conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
     step = 0
 
     while not env._is_done() and step < obs.max_steps:
         conversation.append({"role": "user", "content": build_prompt(obs_dict)})
+
+        # Trim conversation to avoid token overflow
         if len(conversation) > 12:
             conversation = [conversation[0]] + conversation[-10:]
 
         llm_response = call_llm(client, conversation)
 
         if llm_response == _FATAL:
-            print(f"[STEP] step={step+1} reward=0.0 action=quota_exhausted", flush=True)
+            print(
+                f"[STEP] step={step+1} reward=0.0 action=quota_exhausted",
+                flush=True
+            )
             break
 
         if not llm_response:
@@ -158,6 +183,7 @@ def run_task(task_id: str, client: OpenAI) -> Dict[str, Any]:
             result = env.step(action)
             obs_dict = result.observation.model_dump()
 
+            # ✅ This is what the validator looks for
             print(
                 f"[STEP] step={step+1} reward={result.reward.step_reward:.4f} "
                 f"action={action.action_type} email={action.email_id}",
@@ -167,13 +193,19 @@ def run_task(task_id: str, client: OpenAI) -> Dict[str, Any]:
             if result.done:
                 break
 
-        except Exception:
+        except Exception as ex:
             print(f"[STEP] step={step+1} reward=0.0 action=error", flush=True)
 
         step += 1
         time.sleep(0.3)
 
-    grade = GRADERS[task_id](env)
+    try:
+        grade = GRADERS[task_id](env)
+    except Exception as e:
+        print(f"[ERROR] Grader failed: {e}", flush=True)
+        grade = {"score": 0.0}
+
+    # ✅ This is what the validator looks for
     print(f"[END] task={task_id} score={grade['score']:.4f} steps={step}", flush=True)
     return grade
 
@@ -188,8 +220,6 @@ def main():
         sys.exit(1)
 
     client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
-    print(f"Model: {MODEL_NAME}", flush=True)
-    print(f"API:   {API_BASE_URL}", flush=True)
 
     results = {}
     start = time.time()
@@ -209,9 +239,11 @@ def main():
 
     with open("baseline_scores.json", "w") as f:
         json.dump({
-            "model": MODEL_NAME, "api_base": API_BASE_URL,
+            "model": MODEL_NAME,
+            "api_base": API_BASE_URL,
             "scores": {t: g["score"] for t, g in results.items()},
-            "details": results, "elapsed_seconds": round(elapsed, 2),
+            "details": results,
+            "elapsed_seconds": round(elapsed, 2),
         }, f, indent=2)
     print("Results saved to baseline_scores.json", flush=True)
 
