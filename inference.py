@@ -1,20 +1,15 @@
 """
 inference.py — Baseline agent for Email Triage OpenEnv.
 
-Uses the OpenAI client (compatible API) to run an LLM agent against all 3 tasks.
-Reads credentials from environment variables (or .env file):
-  - API_BASE_URL   : LLM API base URL
-  - MODEL_NAME     : Model identifier
-  - OPENAI_API_KEY : OpenAI API key  (preferred when using api.openai.com)
-  - HF_TOKEN       : HuggingFace token (only for HF Inference endpoints)
+Prints structured [START]/[STEP]/[END] blocks required by the validator.
 
-Usage:
-  python inference.py
-  python inference.py --task easy_triage
+Environment variables:
+  API_BASE_URL  : LLM API base URL
+  MODEL_NAME    : Model identifier  
+  HF_TOKEN      : API key (required, no default)
 """
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
@@ -25,13 +20,11 @@ from typing import Any, Dict, List, Optional
 try:
     from openai import OpenAI
 except ImportError:
-    print("ERROR: openai package not installed. Run: pip install openai")
+    print("ERROR: openai package not installed.", flush=True)
     sys.exit(1)
 
-
-# ── Minimal .env loader (runs before anything else) ──────────────────────────
+# ── Load .env if present ──────────────────────────────────────────────────────
 def _load_dotenv(path: str = ".env") -> None:
-    """Load .env file. Shell-exported vars always take priority."""
     env_file = Path(path)
     if not env_file.exists():
         return
@@ -42,179 +35,106 @@ def _load_dotenv(path: str = ".env") -> None:
         key, _, val = line.partition("=")
         key = key.strip()
         val = val.strip().strip('"').strip("'")
-        if key not in os.environ:          # never overwrite shell exports
+        if key not in os.environ:
             os.environ[key] = val
 
 _load_dotenv()
 
+# ── Config ────────────────────────────────────────────────────────────────────
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN     = os.getenv("HF_TOKEN")  # No default per validator requirements
 
-# ── Try importing env directly ───────────────────────────────────────────────
+# ── Import env ───────────────────────────────────────────────────────────────
 try:
     from env.environment import Action, EmailTriageEnv
     from env.graders import GRADERS
-    from env.data import TASK_DESCRIPTIONS
     LOCAL_ENV_AVAILABLE = True
 except ImportError:
     LOCAL_ENV_AVAILABLE = False
 
-
-# ── Config ────────────────────────────────────────────────────────────────────
-# Key selection logic:
-#   - OPENAI_API_KEY (sk-...) must be used against api.openai.com
-#   - HF_TOKEN      (hf_...) must be used against HF Inference API
-#   - They are NOT interchangeable — using hf_... against OpenAI returns 401.
-#
-# Rule: prefer OPENAI_API_KEY; fall back to HF_TOKEN only if OPENAI_API_KEY absent.
-
-# HuggingFace Inference API is the default — free, no credit card, works with hf_ tokens.
-# To use OpenAI instead: set API_BASE_URL=https://api.openai.com/v1 and OPENAI_API_KEY=sk-...
-_HF_BASE    = "https://router.huggingface.co/v1"
-_HF_MODEL   = "Qwen/Qwen2.5-72B-Instruct"   # free on HF Inference
-
-API_BASE_URL = os.environ.get("API_BASE_URL", _HF_BASE)
-MODEL_NAME   = os.environ.get("MODEL_NAME",   _HF_MODEL)
-
-_openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
-_hf_token   = os.environ.get("HF_TOKEN", "").strip()
-
-# Key selection: for HF endpoints use HF_TOKEN; for OpenAI use OPENAI_API_KEY
-_using_hf_endpoint = "huggingface.co" in API_BASE_URL or "hf.co" in API_BASE_URL or "router.huggingface" in API_BASE_URL
-if _using_hf_endpoint:
-    HF_TOKEN = _hf_token if _hf_token else _openai_key   # HF token preferred for HF
-else:
-    HF_TOKEN = _openai_key if _openai_key else _hf_token  # OpenAI key preferred for OpenAI
-
-
 TASKS = ["easy_triage", "medium_triage", "hard_triage"]
 
-SYSTEM_PROMPT = """You are an expert email triage agent. Your job is to process an inbox
-of emails efficiently and accurately.
+SYSTEM_PROMPT = """You are an expert email triage agent.
 
-For each email you MUST:
-1. CLASSIFY it with urgency (critical/high/medium/low) and category
-   (customer_complaint, billing, technical_support, general_inquiry, spam, internal, sales_lead, hr)
-2. Take ONE of these actions:
-   - REPLY with a helpful response (for emails needing human attention)
-   - ARCHIVE (for spam, low-priority, or no-action-needed emails)
-   - ESCALATE with a reason (for critical issues, legal matters, security incidents)
-
-Rules:
-- critical urgency = production outages, security breaches, legal deadlines
-- high urgency = significant business impact, paying customer issues
-- medium urgency = general support, onboarding issues
-- low urgency = spam, compliments, general questions
-
-Output ONE action at a time as valid JSON with this exact structure:
+For each email, output ONE JSON action:
 {
   "action_type": "classify" | "reply" | "archive" | "escalate",
   "email_id": "<id>",
-  "urgency": "<level>",          // only for classify
-  "category": "<category>",      // only for classify
-  "reply_body": "<text>",        // only for reply
-  "escalation_reason": "<text>"  // only for escalate
+  "urgency": "critical" | "high" | "medium" | "low",
+  "category": "customer_complaint" | "billing" | "technical_support" | "general_inquiry" | "spam" | "internal" | "sales_lead" | "hr",
+  "reply_body": "<text if replying>",
+  "escalation_reason": "<text if escalating>"
 }
 
-Process emails in two steps: first classify, then action. Be concise but thorough."""
+First classify all emails, then take actions."""
 
+_FATAL = "__FATAL__"
 
-def build_user_message(obs: Dict[str, Any]) -> str:
-    """Build a clear prompt from the current observation."""
-    pending = [e for e in obs["inbox"] if e["status"] == "pending"]
-    classified = [e for e in obs["inbox"] if e["status"] == "classified"]
-
-    lines = [
-        f"Task: {obs['task_description']}",
-        f"Step {obs['step_number']}/{obs['max_steps']} | "
-        f"Pending: {obs['pending_count']} | Done: {obs['done_count']}",
-        f"Last result: {obs.get('last_action_result', 'N/A')}",
-        "",
-    ]
-
-    if pending:
-        lines.append("=== PENDING EMAILS (need classification) ===")
-        for entry in pending[:3]:  # Show max 3 at a time
-            e = entry["email"]
-            lines.append(f"\nID: {e['id']}")
-            lines.append(f"From: {e.get('from', e.get('from_address', ''))}")
-            lines.append(f"Subject: {e['subject']}")
-            lines.append(f"Body: {e['body'][:300]}")
-    elif classified:
-        lines.append("=== CLASSIFIED EMAILS (need action) ===")
-        for entry in classified[:3]:
-            e = entry["email"]
-            lines.append(f"\nID: {e['id']}")
-            lines.append(f"From: {e.get('from', e.get('from_address', ''))}")
-            lines.append(f"Subject: {e['subject']}")
-            lines.append(f"Body: {e['body'][:300]}")
-            lines.append(f"Urgency: {entry.get('assigned_urgency')} | Category: {entry.get('assigned_category')}")
-
-    lines.append("\nOutput ONE JSON action now.")
-    return "\n".join(lines)
-
-
-# Sentinel returned when the API key is exhausted / unauthorized — stop immediately
-_FATAL_ERROR = "__FATAL__"
 
 def call_llm(client: OpenAI, messages: List[Dict]) -> Optional[str]:
-    """Call the LLM. Returns None on transient error, _FATAL_ERROR on quota/auth failure."""
     try:
         response = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=0.2,
-            max_tokens=512,
+            model=MODEL_NAME, messages=messages, temperature=0.2, max_tokens=512,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        err_str = str(e)
-        print(f"  [LLM error] {e}")
-        # 402 = out of credits, 401 = bad key — both are fatal, stop looping
-        if "402" in err_str or "401" in err_str or "insufficient_quota" in err_str or "depleted" in err_str:
-            return _FATAL_ERROR
+        err = str(e)
+        if any(x in err for x in ["402", "401", "insufficient_quota", "depleted"]):
+            return _FATAL
         return None
 
 
 def parse_action(text: str) -> Optional[Dict[str, Any]]:
-    """Parse JSON action from LLM output, handling code blocks."""
     if not text:
         return None
-    # Strip markdown code blocks
     text = text.replace("```json", "").replace("```", "").strip()
-    # Find JSON object
-    start = text.find("{")
-    end = text.rfind("}") + 1
-    if start == -1 or end == 0:
+    s, e = text.find("{"), text.rfind("}") + 1
+    if s == -1 or e == 0:
         return None
     try:
-        return json.loads(text[start:end])
+        return json.loads(text[s:e])
     except json.JSONDecodeError:
         return None
 
 
-def run_local_task(task_id: str, client: OpenAI) -> Dict[str, Any]:
-    """Run one task using the local environment (no HTTP)."""
+def build_prompt(obs: Dict[str, Any]) -> str:
+    pending = [e for e in obs["inbox"] if e["status"] == "pending"]
+    classified = [e for e in obs["inbox"] if e["status"] == "classified"]
+    lines = [f"Step {obs['step_number']}/{obs['max_steps']} | Pending:{obs['pending_count']} Done:{obs['done_count']}", ""]
+    emails = pending[:3] if pending else classified[:3]
+    label = "CLASSIFY THESE" if pending else "ACT ON THESE"
+    lines.append(f"=== {label} ===")
+    for entry in emails:
+        e = entry["email"]
+        lines.append(f"ID:{e['id']} Subject:{e['subject']}")
+        lines.append(f"Body:{e['body'][:200]}")
+        if not pending:
+            lines.append(f"Urgency:{entry.get('assigned_urgency')} Category:{entry.get('assigned_category')}")
+    lines.append("\nOutput ONE JSON action:")
+    return "\n".join(lines)
+
+
+def run_task(task_id: str, client: OpenAI) -> Dict[str, Any]:
     print(f"[START] task={task_id}", flush=True)
 
     env = EmailTriageEnv()
     obs = env.reset(task_id=task_id)
     obs_dict = obs.model_dump()
-
     conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
     step = 0
-    max_steps = obs.max_steps
 
-    while not env._is_done() and step < max_steps:
-        user_msg = build_user_message(obs_dict)
-        conversation.append({"role": "user", "content": user_msg})
-
-        # Keep conversation manageable
+    while not env._is_done() and step < obs.max_steps:
+        conversation.append({"role": "user", "content": build_prompt(obs_dict)})
         if len(conversation) > 12:
             conversation = [conversation[0]] + conversation[-10:]
 
         llm_response = call_llm(client, conversation)
-        if llm_response == _FATAL_ERROR:
-            print(f"  [FATAL] API quota exhausted — stopping task early. Partial score will be saved.", flush=True)
+
+        if llm_response == _FATAL:
+            print(f"[STEP] step={step+1} reward=0.0 action=quota_exhausted", flush=True)
             break
+
         if not llm_response:
             step += 1
             continue
@@ -223,7 +143,6 @@ def run_local_task(task_id: str, client: OpenAI) -> Dict[str, Any]:
         action_dict = parse_action(llm_response)
 
         if not action_dict:
-            print(f"  Step {step+1}: Could not parse action from LLM output", flush=True)
             step += 1
             continue
 
@@ -240,90 +159,61 @@ def run_local_task(task_id: str, client: OpenAI) -> Dict[str, Any]:
             obs_dict = result.observation.model_dump()
 
             print(
-                f"[STEP] step={step+1} reward={result.reward.step_reward:.3f} "
+                f"[STEP] step={step+1} reward={result.reward.step_reward:.4f} "
                 f"action={action.action_type} email={action.email_id}",
-                flush=True
+                flush=True,
             )
 
             if result.done:
                 break
 
-        except Exception as e:
-            print(f"  Step {step+1}: Error applying action: {e}", flush=True)
+        except Exception:
+            print(f"[STEP] step={step+1} reward=0.0 action=error", flush=True)
 
         step += 1
-        time.sleep(0.3)  # Rate limit friendliness
+        time.sleep(0.3)
 
-    # Final grade
-    grader = GRADERS[task_id]
-    grade = grader(env)
+    grade = GRADERS[task_id](env)
     print(f"[END] task={task_id} score={grade['score']:.4f} steps={step}", flush=True)
     return grade
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Email Triage OpenEnv baseline agent")
-    parser.add_argument("--task", default=None, help="Run only this task (default: all)")
-    parser.add_argument("--local", action="store_true", help="Use local env (no HTTP)")
-    args = parser.parse_args()
-
     if not HF_TOKEN:
-        print("ERROR: No API key found.")
-        print("  Set OPENAI_API_KEY=sk-... in your .env or shell for OpenAI.")
-        print("  Set HF_TOKEN=hf_...   in your .env or shell for HF Inference.")
+        print("ERROR: HF_TOKEN not set.", flush=True)
         sys.exit(1)
 
-    # Guard: hf_ token against openai.com always returns 401
-    if HF_TOKEN.startswith("hf_") and "openai.com" in API_BASE_URL:
-        print("ERROR: Your HF_TOKEN (hf_...) cannot be used with api.openai.com.")
-        print("  Fix: remove API_BASE_URL from .env (defaults to HF Inference),")
-        print("  or set OPENAI_API_KEY=sk-... and point API_BASE_URL to OpenAI.")
+    if not LOCAL_ENV_AVAILABLE:
+        print("ERROR: Could not import env module.", flush=True)
         sys.exit(1)
 
-    key_hint = HF_TOKEN[:12] + "..." if len(HF_TOKEN) > 12 else HF_TOKEN
-    key_src  = "HF_TOKEN" if (os.environ.get("HF_TOKEN") and HF_TOKEN == os.environ.get("HF_TOKEN","").strip()) else "OPENAI_API_KEY"
     client = OpenAI(api_key=HF_TOKEN, base_url=API_BASE_URL)
-    print(f"Model:  {MODEL_NAME}")
-    print(f"API:    {API_BASE_URL}")
-    print(f"Key:    {key_hint} (from {key_src})")
+    print(f"Model: {MODEL_NAME}", flush=True)
+    print(f"API:   {API_BASE_URL}", flush=True)
 
-    tasks_to_run = [args.task] if args.task else TASKS
     results = {}
     start = time.time()
 
-    for task_id in tasks_to_run:
-        if task_id not in TASKS:
-            print(f"Unknown task: {task_id}. Valid: {TASKS}")
-            continue
-        result = run_local_task(task_id, client)
-        results[task_id] = result
+    for task_id in TASKS:
+        results[task_id] = run_task(task_id, client)
 
     elapsed = time.time() - start
-    print(f"\n{'='*60}")
-    print("BASELINE RESULTS SUMMARY")
-    print('='*60)
+    print("=" * 60, flush=True)
+    print("BASELINE RESULTS SUMMARY", flush=True)
+    print("=" * 60, flush=True)
     for task_id, grade in results.items():
-        print(f"  {task_id:20s}: {grade['score']:.4f}")
-    if results:
-        avg = sum(g["score"] for g in results.values()) / len(results)
-        print(f"  {'AVERAGE':20s}: {avg:.4f}")
-    print(f"\n  Total time: {elapsed:.1f}s")
-    print('='*60)
+        print(f"  {task_id:20s}: {grade['score']:.4f}", flush=True)
+    avg = sum(g["score"] for g in results.values()) / len(results)
+    print(f"  {'AVERAGE':20s}: {avg:.4f}", flush=True)
+    print(f"  Total time: {elapsed:.1f}s", flush=True)
 
-    # Write results to file for reproducibility
     with open("baseline_scores.json", "w") as f:
-        json.dump(
-            {
-                "model": MODEL_NAME,
-                "api_base": API_BASE_URL,
-                "scores": {t: g["score"] for t, g in results.items()},
-                "details": results,
-                "elapsed_seconds": round(elapsed, 2),
-            },
-            f,
-            indent=2,
-        )
-    print("Results saved to baseline_scores.json")
+        json.dump({
+            "model": MODEL_NAME, "api_base": API_BASE_URL,
+            "scores": {t: g["score"] for t, g in results.items()},
+            "details": results, "elapsed_seconds": round(elapsed, 2),
+        }, f, indent=2)
+    print("Results saved to baseline_scores.json", flush=True)
 
 
 if __name__ == "__main__":
